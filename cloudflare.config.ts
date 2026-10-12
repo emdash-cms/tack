@@ -25,12 +25,16 @@ const EMAIL_FROM = "";
 // share storage.
 const NAME = "tack";
 
+// The instance's custom domain (production only: Previews keep their own URLs).
+const DOMAIN = "tack.emdashcms.com";
+
 export default defineConfig(({ isPreview, mode }) => ({
 	worker: {
 		name: NAME,
 		entrypoint,
 		compatibilityDate,
 		compatibilityFlags,
+		...(isPreview ? {} : { domains: [DOMAIN] }),
 		assets: {
 			notFoundHandling: "single-page-application",
 			runWorkerFirst: [
