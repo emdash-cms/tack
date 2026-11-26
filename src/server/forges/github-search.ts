@@ -41,17 +41,32 @@ const MAX_QUERY = 256;
 const DEFAULT_LIMIT = 50;
 const MAX_LIMIT = 100;
 
+// Issue search only finds the items: their ids, as reading full cards (CI
+// with every check, reviews, linked issues) for 50 busy pull requests in one
+// request takes GitHub past its 10 s limit, and it answers 502 or 504. They're
+// read afterwards by id, `ITEMS_BATCH` a request, side by side.
 const SEARCH = `query TackSearch($q: String!, $first: Int!) {
 	search(query: $q, type: ISSUE, first: $first) {
 		issueCount
 		nodes {
-			${ITEM}
-			... on Issue { repository { isPrivate } }
-			... on PullRequest { repository { isPrivate } }
+			__typename
+			... on Issue { id }
+			... on PullRequest { id }
 		}
+	}
+}`;
+
+const SEARCH_ITEMS = `query TackSearchItems($ids: [ID!]!) {
+	nodes(ids: $ids) {
+		${ITEM}
+		... on Issue { repository { isPrivate } }
+		... on PullRequest { repository { isPrivate } }
 	}
 }
 ${FRAGMENTS}`;
+
+/** Full items a request: a few seconds' work for GitHub even when they're busy pull requests. */
+const ITEMS_BATCH = 20;
 
 // Discussions are a search of their own on GitHub (`type: DISCUSSION`), with
 // their own count. `is:discussion` isn't a qualifier GitHub knows: it's how
@@ -68,7 +83,10 @@ const DISCUSSION_SEARCH = `query TackSearch($q: String!, $first: Int!) {
 }
 ${DISCUSSION_FRAGMENT}`;
 
-type SearchNode = GqlItem & { repository?: { nameWithOwner: string; isPrivate?: boolean } };
+type SearchNode = GqlItem & {
+	id?: string;
+	repository?: { nameWithOwner: string; isPrivate?: boolean };
+};
 
 function error(reason: QueryError["reason"], message: string, retryAt?: number): QueryError {
 	return { kind: "error", reason, message, ...(retryAt ? { retryAt } : {}) };
@@ -199,46 +217,35 @@ async function searchGraphQL(
 	token: string,
 	kind: "issues" | "discussions",
 ): Promise<SearchResult | QueryError> {
-	let response: Response;
-	try {
-		response = await forgeFetch(GRAPHQL, {
-			method: "POST",
-			headers: { ...headers(token), "content-type": "application/json" },
-			body: JSON.stringify({
-				query: kind === "discussions" ? DISCUSSION_SEARCH : SEARCH,
-				variables: { q, first: limit },
-				operationName: "TackSearch",
-			}),
-		});
-	} catch {
-		return error("error", "GitHub couldn't be reached.");
-	}
-	const retryAt = await retryAtOf(response, GRAPHQL);
-	if (retryAt)
-		return error("rate_limited", "GitHub asked Tack to slow down its searches.", retryAt);
-	if (response.status === 401) return error("no_access", "GitHub didn't accept the token.");
-	if (!response.ok) return error("error", `GitHub answered ${response.status}.`);
-	const body = await response.json<{
-		data?: { search?: { issueCount: number; nodes: (SearchNode | null)[] } } | null;
-		errors?: { type?: string; message?: string }[];
-	}>();
-	const problem = body.errors?.[0];
-	if (graphqlRateLimited(body.errors)) {
-		return error(
-			"rate_limited",
-			"GitHub asked Tack to slow down its searches.",
-			noteBodyLimit(`Bearer ${token}`, response, GRAPHQL),
-		);
-	}
-	const search = body.data?.search;
+	const found = await postGraphQL<{
+		search?: { issueCount: number; nodes: (SearchNode | null)[] };
+	}>(token, "TackSearch", kind === "discussions" ? DISCUSSION_SEARCH : SEARCH, { q, first: limit });
+	if ("kind" in found) return found;
+	const search = found.data?.search;
 	if (!search) {
+		const problem = found.errors?.[0];
 		return error(
 			"invalid",
 			problem?.message ? plainSearchError(problem.message, q) : "GitHub couldn't run this search.",
 		);
 	}
+	let nodes = search.nodes;
+	if (kind === "issues") {
+		const ids = nodes.flatMap((node) => (node?.id ? [node.id] : []));
+		const batches = await Promise.all(
+			chunks(ids, ITEMS_BATCH).map((batch) =>
+				postGraphQL<{ nodes?: (SearchNode | null)[] }>(token, "TackSearchItems", SEARCH_ITEMS, {
+					ids: batch,
+				}),
+			),
+		);
+		const failed = batches.find((batch) => "kind" in batch);
+		if (failed && "kind" in failed) return failed;
+		// Items gone, or no longer readable, since the search are left out.
+		nodes = batches.flatMap((batch) => ("kind" in batch ? [] : (batch.data?.nodes ?? [])));
+	}
 	const items: Card[] = [];
-	for (const node of search.nodes) {
+	for (const node of nodes) {
 		if (!node) continue;
 		const isPrivate = node.repository?.isPrivate;
 		const card =
@@ -254,6 +261,49 @@ async function searchGraphQL(
 		items.push({ ...card, visibility: isPrivate === false ? "public" : "private" });
 	}
 	return { kind: "search", total: search.issueCount, items };
+}
+
+/** One GraphQL request for a search: its body, or why there isn't one. */
+async function postGraphQL<T>(
+	token: string,
+	operationName: string,
+	query: string,
+	variables: Record<string, unknown>,
+): Promise<{ data?: T | null; errors?: { type?: string; message?: string }[] } | QueryError> {
+	let response: Response;
+	try {
+		response = await forgeFetch(GRAPHQL, {
+			method: "POST",
+			headers: { ...headers(token), "content-type": "application/json" },
+			body: JSON.stringify({ query, variables, operationName }),
+		});
+	} catch {
+		return error("error", "GitHub couldn't be reached.");
+	}
+	const retryAt = await retryAtOf(response, GRAPHQL);
+	if (retryAt)
+		return error("rate_limited", "GitHub asked Tack to slow down its searches.", retryAt);
+	if (response.status === 401) return error("no_access", "GitHub didn't accept the token.");
+	if (!response.ok) return error("error", `GitHub answered ${response.status}.`);
+	const body = await response
+		.json<{ data?: T | null; errors?: { type?: string; message?: string }[] }>()
+		.catch(() => null);
+	// GitHub sometimes gives up on a request with an empty 200.
+	if (!body) return error("error", "GitHub didn't finish answering.");
+	if (graphqlRateLimited(body.errors)) {
+		return error(
+			"rate_limited",
+			"GitHub asked Tack to slow down its searches.",
+			noteBodyLimit(`Bearer ${token}`, response, GRAPHQL),
+		);
+	}
+	return body;
+}
+
+function chunks<T>(list: T[], size: number): T[][] {
+	const result: T[][] = [];
+	for (let i = 0; i < list.length; i += size) result.push(list.slice(i, i + size));
+	return result;
 }
 
 interface RestSearch {

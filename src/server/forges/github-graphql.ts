@@ -23,8 +23,12 @@ import { forgeFetch, graphqlRateLimited, noteBodyLimit } from "./rateLimit.ts";
 const HOST = "github.com";
 const ENDPOINT = "https://api.github.com/graphql";
 
-/** Full items per request, well inside GitHub's node limits. */
-const ITEM_BATCH = 50;
+/**
+ * Full items per request. Fifty busy pull requests (every check of their
+ * latest commit) take GitHub past its 10 s limit, so it answers 502 or 504;
+ * twenty take a few seconds.
+ */
+const ITEM_BATCH = 20;
 /** `nodes(ids:)` takes at most 100 ids. */
 const FRESHNESS_BATCH = 100;
 
